@@ -58,32 +58,6 @@ lat_lon = np.array([
     [46.6354, 32.6169]   # Kherson
 ])
 
-
-class SimState:
-    def __init__(self, N, time, B_init, NR_init, NU_init):
-        # Inventory queues per node
-        self.wbb_queues = [[] for _ in range(N)]
-        self.plt_queues = [[] for _ in range(N)]
-
-        # Redistribution
-        self.redistribution_events = []
-        self.last_redistribution_check = -6.0
-
-        # Logging arrays
-        self.unmet_demand_log = np.zeros((N, len(time)))
-        self.live_WBB = np.zeros((N, len(time)))
-        self.live_PLT = np.zeros((N, len(time)))
-
-        # Blood product inventories (copy starting inventories)
-        self.B_init = {k: np.copy(v) for k, v in B_init.items()}
-        self.NR_init = np.copy(NR_init)
-        self.NU_init = np.copy(NU_init)
-
-        # Time & nodes (for later)
-        self.N = N
-        self.time = time
-
-
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371  # Earth radius (km)
     dlat = np.radians(lat2 - lat1)
@@ -146,8 +120,14 @@ for i in range(N):
         interval = np.random.uniform(48, 72)
         delay = np.random.uniform(4, 8)
         arrival = t + delay
-        if not in_blackout(arrival, blackout_windows):
-            resupply_schedule[i].append(arrival)
+        if in_blackout(arrival, blackout_windows):
+            for window in blackout_windows:
+                if window[0] <= arrival <= window[1]:
+                    arrival = window[1] + 0.1  # push just past blackout
+                    break
+        # Now always append the (possibly delayed) arrival
+        resupply_schedule[i].append(arrival)
+
         t += interval
 
 #--Redistribution between individual CSHs--
@@ -178,6 +158,9 @@ B_init = {
 }
 NR_init = np.full(N, N_total)
 NU_init = np.zeros(N)
+
+cum_casualties=[[]for _ in range(N)]
+running_total=[0]*N
 
 def generate_casualties(N, t):
         base = 3
@@ -223,7 +206,7 @@ wbb_queues = [[] for _ in range(N)]
 plt_queues = [[] for _ in range(N)]
 
 
-def system(t, y,state):
+def system(t, y):
     global last_redistribution_check
 
     # Convert flat y back into inventory dictionary for live snapshot
@@ -353,10 +336,6 @@ def system(t, y,state):
 
     return np.concatenate([dB[k] for k in ["RBC", "FFP", "PLT", "CRYO", "WBB"]] + [dNR, dNU])
 
-# Purge processed redistribution events
-redistribution_events[:] = [e for e in redistribution_events if e[4] > t]
-
-
 def system_with_logging(t, y):
     global low_supply_events, wbb_overwhelmed_events
     # Call the original system function
@@ -370,9 +349,9 @@ def system_with_logging(t, y):
         live_PLT[i, t_idx] = sum(qty for age, qty in plt_queues[i])
 
     # Low supply alerts
-    for i in range(N):
-        for k in INIT_STOCK:
-            idx = list(PROPORTIONS.keys()).index(k)
+    for k in INIT_STOCK:
+        idx = list(PROPORTIONS.keys()).index(k)
+        for i in range(N):
             val = y[idx * N + i]
             if val < THRESHOLD_FRACTION * INIT_STOCK[k]:
                 low_supply_events[k][i].append(t)
@@ -446,6 +425,11 @@ axs[4].set_ylabel('WBB Units (live)')
 axs[-1].set_xlabel('Time (hours)')
 plt.tight_layout()
 plt.show()
+
+def evaluate_plt_coverage(live_PLT, threshold=0.1):
+    durations = np.sum(live_PLT < (threshold * INIT_PLT), axis=1) * dt
+    coverage = 100 * (1 - durations / T_max)
+    return coverage, durations
 
 def run_simulation(seed):
     np.random.seed(seed)
@@ -521,6 +505,8 @@ def run_simulation(seed):
         if np.any(unable_all):
             failure_counts[i] += 1
 
+    coverage, durations = evaluate_plt_coverage(live_PLT)
+
     return failure_counts
 
 ## Run the simulation
@@ -570,3 +556,101 @@ plt.legend(loc='upper right')
 plt.grid(True, axis='x', linestyle='--', alpha=0.5)
 plt.tight_layout()
 plt.show()
+
+def generate_interval_graphs(intervals=[24, 36, 48, 72, 120]):
+    """
+    Replaces the stress test function with a graph-focused simulation loop.
+    For each interval in `intervals`, run a single simulation and generate plots.
+    """
+    for interval in intervals:
+        print(f"\n🌀 Simulating with resupply interval: {interval} hours...")
+
+        # Seeded randomness for repeatability
+        np.random.seed(0)
+
+        # Generate blackout windows
+        blackout_windows.clear()
+        t = 0
+        while t < T_max:
+            if np.random.rand() < 0.05:
+                start = t
+                duration = np.random.uniform(24, 48)
+                blackout_windows.append((start, start + duration))
+                t += duration
+            else:
+                t += 6
+
+        # Build resupply schedule with fixed interval + delivery delay
+        for i in range(N):
+            resupply_schedule[i] = []
+            t = 0
+            while t < T_max:
+                delay = np.random.uniform(2, 4)
+                arrival = t + delay
+                if not in_blackout(arrival, blackout_windows):
+                    resupply_schedule[i].append(arrival)
+                t += interval
+
+        # Reset simulation state
+        global wbb_queues, plt_queues, redistribution_events, last_redistribution_check, unmet_demand_log,cum_casualties, running_total
+        wbb_queues = [[] for _ in range(N)]
+        plt_queues = [[] for _ in range(N)]
+        cum_casualties=[[] for _ in range(N)]
+        running_total=[[] for _ in range(N)]
+        redistribution_events = []
+        last_redistribution_check = -6.0
+        unmet_demand_log = np.zeros((N, len(time)))
+        live_WBB.fill(0)
+        live_PLT.fill(0)
+
+        y0 = np.concatenate([B_init[k] for k in ["RBC", "FFP", "PLT", "CRYO", "WBB"]] + [NR_init, NU_init])
+        sol = solve_ivp(system_with_logging, [0, T_max], y0, t_eval=time, method='RK45')
+
+        # Plot blood product levels for each interval
+        fig, axs = plt.subplots(5, 1, figsize=(12, 16), sharex=True)
+        labels = [f"FOB {i}" for i in range(N)]
+
+        for i in range(N):
+            axs[0].plot(time, sol.y[0*N + i], label=labels[i])
+        axs[0].set_ylabel('RBC Units')
+        axs[0].legend()
+
+        for i in range(N):
+            axs[1].plot(time, sol.y[1*N + i], label=labels[i])
+        axs[1].set_ylabel('FFP Units')
+
+        for i in range(N):
+            axs[2].plot(time, live_PLT[i], label=labels[i])
+        axs[2].set_ylabel('PLT Units (Live)')
+
+        for i in range(N):
+            axs[3].plot(time, sol.y[3*N + i], label=labels[i])
+        axs[3].set_ylabel('CRYO Units')
+
+        for i in range(N):
+            axs[4].plot(time, live_WBB[i], label=labels[i])
+        axs[4].set_ylabel('WBB Units (Live)')
+        axs[4].set_xlabel('Time (hours)')
+
+        plt.suptitle(f"Blood Product Dynamics — Resupply Interval = {interval} hrs")
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.show()
+
+        print(f"time shape: {len(time)}")
+        for i in range(N):
+            print(f"FOB {i} casualty length: {len(cum_casualties[i])}")
+
+        plt.figure(figsize=(12, 6))
+        for i in range(N):
+            plt.plot(time, cum_casualties[i], label=f"FOB {i}")
+        plt.title("📉 Casualties Over Time")
+        plt.xlabel("Time (hours)")
+        plt.ylabel("Casualties per Hour")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+        #print(cum_casualties)
+
+
+generate_interval_graphs()
