@@ -26,6 +26,8 @@ INIT_STOCK = {
 
 low_supply_events = {k: [[] for _ in range(N)] for k in INIT_STOCK}  # list of times per product per node
 wbb_overwhelmed_events = [[] for _ in range(N)]
+last_casualties = np.zeros(N)
+t_log_set = set(np.round(time, 6))  # Ensure matching step times
 
 
 # Deployment and resupply ratios
@@ -57,6 +59,31 @@ lat_lon = np.array([
     [48.4647, 35.0462],  # Dnipro
     [46.6354, 32.6169]   # Kherson
 ])
+
+class CasualtyLogger:
+    def __init__(self, N, t_eval):
+        self.N = N
+        self.t_eval = np.round(t_eval, 6)
+        self.index = 0
+        self.running_total = [0] * N
+        self.cum_casualties = [[] for _ in range(N)]
+
+    def log(self, t, casualties):
+        t_rounded = np.round(t, 6)
+        if self.index < len(self.t_eval) and np.isclose(t_rounded, self.t_eval[self.index], atol=1e-8):
+            for i in range(self.N):
+                self.running_total[i] += casualties[i]
+                self.cum_casualties[i].append(self.running_total[i])
+            self.index += 1
+
+    def reset(self):
+        self.index = 0
+        self.running_total = [0] * self.N
+        self.cum_casualties = [[] for _ in range(self.N)]
+
+    def get_cumulative(self):
+        return self.cum_casualties
+
 
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371  # Earth radius (km)
@@ -159,9 +186,6 @@ B_init = {
 NR_init = np.full(N, N_total)
 NU_init = np.zeros(N)
 
-cum_casualties=[[]for _ in range(N)]
-running_total=[0]*N
-
 def generate_casualties(N, t):
         base = 3
         if 24*5 < t < 24*10:  # simulate a 5-day spike
@@ -206,8 +230,10 @@ wbb_queues = [[] for _ in range(N)]
 plt_queues = [[] for _ in range(N)]
 
 
-def system(t, y):
+def system(t, y, logger=None):
     global last_redistribution_check
+
+
 
     # Convert flat y back into inventory dictionary for live snapshot
     B_live = {k: y[i * N:(i + 1) * N] for i, k in enumerate(["RBC", "FFP", "PLT", "CRYO", "WBB"])}
@@ -225,6 +251,9 @@ def system(t, y):
     dNU = np.zeros(N)
 
     casualties = generate_casualties(N, t)
+    if logger:
+        logger.log(t, casualties)
+
     demand = casualty_blood_demand(casualties)
     unmet=False
 
@@ -336,8 +365,14 @@ def system(t, y):
 
     return np.concatenate([dB[k] for k in ["RBC", "FFP", "PLT", "CRYO", "WBB"]] + [dNR, dNU])
 
+def make_system_with_logger(logger):
+    def wrapped(t, y):
+        return system(t, y, logger)
+    return wrapped
+
+
 def system_with_logging(t, y):
-    global low_supply_events, wbb_overwhelmed_events
+    global low_supply_events, wbb_overwhelmed_events, last_casualties
     # Call the original system function
     dydt = system(t, y)
 
@@ -557,55 +592,22 @@ plt.grid(True, axis='x', linestyle='--', alpha=0.5)
 plt.tight_layout()
 plt.show()
 
+
 def generate_interval_graphs(intervals=[24, 36, 48, 72, 120]):
-    """
-    Replaces the stress test function with a graph-focused simulation loop.
-    For each interval in `intervals`, run a single simulation and generate plots.
-    """
     for interval in intervals:
         print(f"\n🌀 Simulating with resupply interval: {interval} hours...")
 
-        # Seeded randomness for repeatability
-        np.random.seed(0)
+        # Setup
+        time = np.linspace(0, T_max, int(T_max / dt))
+        y0 = np.concatenate([B_init[k] for k in ["RBC", "FFP", "PLT", "CRYO", "WBB"]] + [NR_init, NU_init])  # <-- replace this with your actual initial condition logic
+        logger = CasualtyLogger(N, time)
+        wrapped_system = make_system_with_logger(logger)
 
-        # Generate blackout windows
-        blackout_windows.clear()
-        t = 0
-        while t < T_max:
-            if np.random.rand() < 0.05:
-                start = t
-                duration = np.random.uniform(24, 48)
-                blackout_windows.append((start, start + duration))
-                t += duration
-            else:
-                t += 6
+        # Solve ODE
+        sol = solve_ivp(wrapped_system, [0, T_max], y0, t_eval=time, method='RK45')
 
-        # Build resupply schedule with fixed interval + delivery delay
-        for i in range(N):
-            resupply_schedule[i] = []
-            t = 0
-            while t < T_max:
-                delay = np.random.uniform(2, 4)
-                arrival = t + delay
-                if not in_blackout(arrival, blackout_windows):
-                    resupply_schedule[i].append(arrival)
-                t += interval
-
-        # Reset simulation state
-        global wbb_queues, plt_queues, redistribution_events, last_redistribution_check, unmet_demand_log,cum_casualties, running_total
-        wbb_queues = [[] for _ in range(N)]
-        plt_queues = [[] for _ in range(N)]
-        cum_casualties=[[] for _ in range(N)]
-        running_total=[[] for _ in range(N)]
-        redistribution_events = []
-        last_redistribution_check = -6.0
-        unmet_demand_log = np.zeros((N, len(time)))
-        live_WBB.fill(0)
-        live_PLT.fill(0)
-
-        y0 = np.concatenate([B_init[k] for k in ["RBC", "FFP", "PLT", "CRYO", "WBB"]] + [NR_init, NU_init])
-        sol = solve_ivp(system_with_logging, [0, T_max], y0, t_eval=time, method='RK45')
-
+        # Pull logger data
+        cum_casualties = logger.get_cumulative()
         # Plot blood product levels for each interval
         fig, axs = plt.subplots(5, 1, figsize=(12, 16), sharex=True)
         labels = [f"FOB {i}" for i in range(N)]
@@ -636,21 +638,18 @@ def generate_interval_graphs(intervals=[24, 36, 48, 72, 120]):
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         plt.show()
 
-        print(f"time shape: {len(time)}")
-        for i in range(N):
-            print(f"FOB {i} casualty length: {len(cum_casualties[i])}")
+        # plt.figure(figsize=(12, 6))
+        # for i in range(N):
+        #     plt.plot(time, cum_casualties[i], label=f"FOB {i}")
+        # plt.title("📉 Casualties Over Time")
+        # plt.xlabel("Time (hours)")
+        # plt.ylabel("Casualties per Hour")
+        # plt.legend()
+        # plt.grid(True)
+        # plt.tight_layout()
+        # plt.show()
+        print(cum_casualties)
 
-        plt.figure(figsize=(12, 6))
-        for i in range(N):
-            plt.plot(time, cum_casualties[i], label=f"FOB {i}")
-        plt.title("📉 Casualties Over Time")
-        plt.xlabel("Time (hours)")
-        plt.ylabel("Casualties per Hour")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-        #print(cum_casualties)
 
 
 generate_interval_graphs()
