@@ -1,0 +1,560 @@
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Model Parameters ---
+N = 5  # number of nodes
+T_max = 24 * 30  # total time in hours (30 days)
+dt = 0.1
+time = np.arange(0, T_max, dt)
+
+# Initial deployment quantities per node (CSH)
+INIT_RBC = 300
+INIT_FFP = 100
+INIT_PLT = 24
+INIT_CRYO = 100
+INIT_WBB = 0
+INIT_CAS = 0
+
+THRESHOLD_FRACTION = 0.10
+INIT_STOCK = {
+    "RBC": INIT_RBC,
+    "FFP": INIT_FFP,
+    "PLT": INIT_PLT,
+    "CRYO": INIT_CRYO,
+    "CAS": INIT_CAS
+}
+
+low_supply_events = {k: [[] for _ in range(N)] for k in INIT_STOCK}  # list of times per product per node
+wbb_overwhelmed_events = [[] for _ in range(N)]
+
+
+# Deployment and resupply ratios
+PROPORTIONS = {"RBC": INIT_RBC, "FFP": INIT_FFP, "PLT": INIT_PLT, "CRYO": INIT_CRYO}
+TOTAL_DEPLOY = sum(PROPORTIONS.values())
+RESUPPLY_RATIO = {k: v / TOTAL_DEPLOY for k, v in PROPORTIONS.items()}
+
+# Blood constraints
+B_max = 500 # IDEK if I need this but I figure we only have so many freezers
+WBB_RATE = 10.0  # units/hr per node
+tau = 6.0 * 24   # donor cooldown (hours)
+setup_delay = 4.0
+N_total = 400
+#p_resupply = np.full(N, 0.5)  # use this for stochastic resupplies, could be useful
+#gamma = 0.05  # redistribution coefficient in conjuction with above line
+
+# Adjacency matrix
+A = np.eye(N, k=1) + np.eye(N, k=-1)
+t_setup = np.random.uniform(0, setup_delay, N)
+
+# Travel time matrix (in hours) for Blackhawk redistribution (based on ~270 km/h)
+# Nodes: 0=Kherson, 1=Crimea, 2=Tokmak, 3=E105, 4=Rivnopil
+
+# Lat/lon (deg) for 5 CSH nodes
+lat_lon = np.array([
+    [49.9935, 36.2304],  # Kharkiv
+    [48.5862, 38.0000],  # Bakhmut
+    [47.8388, 35.1396],  # Zaporizhzhia
+    [48.4647, 35.0462],  # Dnipro
+    [46.6354, 32.6169]   # Kherson
+])
+
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371  # Earth radius (km)
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+# Create travel time matrix (in hours)
+speed_kmph = 278
+buffer_time = 0.167  # ~10 minutes
+
+N = len(lat_lon)
+travel_time_matrix = np.zeros((N, N))
+
+for i in range(N):
+    for j in range(N):
+        if i != j:
+            dist = haversine(*lat_lon[i], *lat_lon[j])
+            travel_time_matrix[i, j] = dist / speed_kmph + buffer_time
+
+print("Travel Time Matrix (hrs):")
+print(np.round(travel_time_matrix, 2))
+
+# travel_times = np.array([
+#     [ 0.00, 0.56, 0.48, 0.85, 1.11],
+#     [0.56, 0.00, 0.63, 1.00,  np.inf],
+#     [0.48, 0.63, 0.00, 0.33, 0.59],
+#     [0.85, 1.00, 0.33, 0.00, 0.26],
+#     [1.11,  np.inf, 0.59, 0.26, 0.00],]
+# )
+
+def get_flight_delay(i, j):
+    base_time = travel_time_matrix[i, j]
+    if not np.isfinite(base_time):
+        return np.inf
+    jitter = np.random.uniform(0.25, 1.0)  # delay due to terrain, enemy contact, etc.
+    return base_time + jitter
+
+
+# --- Generate Blackout Windows (shared across all nodes) ---
+blackout_windows = []
+t = 0
+while t < T_max:
+    if np.random.rand() < 0.15:  # ~15% chance every 6 hrs → blackout (loss of air superiority once a day)
+        start = t
+        duration = np.random.uniform(24, 48)  # blackout lasts 1–2 days
+        blackout_windows.append((start, start + duration))
+        t += duration
+    else:
+        t += 6  # check for new blackout every 6 hrs
+
+def in_blackout(t, blackout_windows):
+    return any(start <= t <= end for start, end in blackout_windows)
+
+# --- Scheduled resupply arrivals ---
+resupply_schedule = [[] for _ in range(N)]
+for i in range(N):
+    t = 0
+    while t < T_max:
+        interval = np.random.uniform(48, 72)
+        delay = np.random.uniform(4, 8)
+        arrival = t + delay
+        if in_blackout(arrival, blackout_windows):
+            for window in blackout_windows:
+                if window[0] <= arrival <= window[1]:
+                    arrival = window[1] + 0.1  # push just past blackout
+                    break
+        # Now always append the (possibly delayed) arrival
+        resupply_schedule[i].append(arrival)
+
+        t += interval
+
+#--Redistribution between individual CSHs--
+redistribution_events = []  # (from_node, to_node, product, qty, arrival_time)
+redistribution_check_interval = 6.0  # hours
+redistribution_delay_range = (2, 4)  # hours
+
+
+def schedule_redistribution(t, B):
+    for i in range(N):
+        for j in range(N):
+            if A[i, j] and np.isfinite(travel_time_matrix[i, j]):
+                for k in ["RBC", "FFP", "PLT", "CRYO"]:
+                    if B[k][i] > B[k][j] + 50 and (B["RBC"][j] + B["WBB"][j]) >= 1:
+                        qty = min(30, B[k][i] - B[k][j])
+                        delay = get_flight_delay(i, j)
+                        arrival_time = t + delay
+                        redistribution_events.append((i, j, k, qty, arrival_time))
+
+
+B_init = {
+    "RBC": np.full(N, INIT_RBC, dtype=float),
+    "FFP": np.full(N, INIT_FFP, dtype=float),
+    "PLT": np.full(N, INIT_PLT, dtype=float),
+    "CRYO": np.full(N, INIT_CRYO, dtype=float),
+    "WBB": np.zeros(N, dtype=float),
+    "CAS": np.zeros(N, dtype=float),
+}
+NR_init = np.full(N, N_total, dtype=float)
+NU_init = np.zeros(N, dtype=float)
+
+# cum_casualties=[[]for _ in range(N)]
+# running_total=[0]*N
+
+def generate_casualties(N, t):
+        base = 3
+        if 24*5 < t < 24*10:  # simulate a 5-day spike
+            base = 8
+        casualties = np.random.poisson(base, size=N)
+        return {"CAS" : casualties }
+
+
+
+def casualty_blood_demand(casualties):
+    need = (casualties / 3).astype(int)
+    return {
+        "RBC": need,
+        "FFP": need,
+        "PLT": (need + 3) // 4,
+        "CRYO": (need + 4) // 5,
+        "WBB": np.zeros_like(need),
+    }
+
+def withdraw_from_queue(queue, needed):
+    withdrawn = 0
+    new_queue = []
+    for age, qty in queue:
+        if withdrawn >= needed:
+            new_queue.append([age, qty])
+        else:
+            take = min(qty, needed - withdrawn)
+            withdrawn += take
+            if qty > take:
+                new_queue.append([age, qty - take])
+    return new_queue, withdrawn
+
+
+#--Establish a dynamic queue for checking last redistributions between CSH--
+last_redistribution_check = -12.0  # forces initial scheduling at t = 0
+unmet_demand_log = np.zeros((N, len(time)))  # nodes × time
+# Expiration time constants
+EXPIRY_WBB = 24   # hours
+EXPIRY_PLT = 120  # hours
+
+# Per-node age-tracking queues (list of [age, quantity] pairs)
+wbb_queues = [[] for _ in range(N)]
+plt_queues = [[] for _ in range(N)]
+
+
+def step(t, B, NR, NU):
+    global last_redistribution_check
+
+    if t - last_redistribution_check >= redistribution_check_interval:
+        schedule_redistribution(t, B)
+        last_redistribution_check = t
+
+    casualties = generate_casualties(N, t)
+    demand = casualty_blood_demand(casualties["CAS"])
+
+    for i in range(N):
+        # Age blood queues
+        wbb_queues[i] = [[age + dt, qty] for age, qty in wbb_queues[i] if age + dt <= EXPIRY_WBB]
+        plt_queues[i] = [[age + dt, qty] for age, qty in plt_queues[i] if age + dt <= EXPIRY_PLT]
+        B["WBB"][i] = sum(qty for age, qty in wbb_queues[i])
+        B["PLT"][i] = sum(qty for age, qty in plt_queues[i])
+        B["CAS"][i] += casualties["CAS"][i]
+
+    # Process redistribution arrivals
+    for event in list(redistribution_events):
+        from_node, to_node, k, qty, arrival_time = event
+        if abs(t - arrival_time) < dt / 2:
+            B[k][to_node] += qty
+            B[k][from_node] -= qty
+            redistribution_events.remove(event)
+
+    for i in range(N):
+        S = 1 if demand["RBC"][i] > 0 and (B["RBC"][i] + B["WBB"][i]) >= 4 else 0
+        n_needed = demand["RBC"][i]
+        unmet = False
+
+        for _ in range(n_needed):
+            rbc_ok = B["RBC"][i] >= 4
+            ffp_ok = B["FFP"][i] >= 4
+            plt_ok = B["PLT"][i] >= 1
+            wbb_ok = B["WBB"][i] >= 1
+            cryo_ok = B["CRYO"][i] >= 1
+
+            # Try full MTP
+            if rbc_ok and ffp_ok and plt_ok:
+                plt_queues[i], used = withdraw_from_queue(plt_queues[i], 1)
+                if used >= 1:
+                    B["RBC"][i] -= 4
+                    B["FFP"][i] -= 4
+                    B["PLT"][i] -= used
+                    continue
+
+            # Try 1 WBB
+            elif wbb_ok:
+                wbb_queues[i], used = withdraw_from_queue(wbb_queues[i], 1)
+                if used >= 1:
+                    B["WBB"][i] -= used
+                    continue
+
+            # Try RBC + FFP only
+            elif rbc_ok and ffp_ok:
+                B["RBC"][i] -= 4
+                B["FFP"][i] -= 4
+                continue
+
+            # Try 1 FFP + 1 PLT
+            elif B["FFP"][i] >= 1 and plt_ok:
+                plt_queues[i], used = withdraw_from_queue(plt_queues[i], 1)
+                if used >= 1:
+                    B["FFP"][i] -= 1
+                    B["PLT"][i] -= used
+                    continue
+
+            # Final fallback: 1 CRYO
+            elif cryo_ok:
+                B["CRYO"][i] -= 1
+                continue
+
+            unmet = True
+
+        if unmet:
+            unmet_demand_log[i, int(t / dt)] += 1
+
+        # WBB generation
+        if S and t > t_setup[i] and NR[i] > 0 and B["WBB"][i] < B_max:
+            max_draw = min(WBB_RATE * dt, NR[i], B_max - B["WBB"][i])
+            wbb_queues[i].append([0.0, max_draw])
+            NR[i] -= max_draw
+            NU[i] += max_draw
+
+        # Scheduled resupply
+        for arrival_time in resupply_schedule[i]:
+            if abs(t - arrival_time) < dt / 2:
+                delivery = np.random.randint(180, 241)
+                baseline = {"RBC": INIT_RBC, "FFP": INIT_FFP, "PLT": INIT_PLT, "CRYO": INIT_CRYO}
+                depletion = {k: max(0, 1.0 - B[k][i] / baseline[k]) for k in ["RBC", "FFP", "PLT", "CRYO"]}
+                total = sum(depletion.values()) + 1e-6
+                for k in ["RBC", "FFP", "PLT", "CRYO"]:
+                    share = depletion[k] / total
+                    units = delivery * share * S
+                    if k == "PLT":
+                        plt_queues[i].append([0.0, units])
+                    else:
+                        B[k][i] += units
+                break
+
+    # Donor recovery
+    NR += (NU / tau) * dt
+    NU -= (NU / tau) * dt
+
+    # Record outputs
+    t_idx = int(t / dt)
+    for i in range(N):
+        live_WBB[i, t_idx] = sum(qty for age, qty in wbb_queues[i])
+        live_PLT[i, t_idx] = sum(qty for age, qty in plt_queues[i])
+        live_CAS[i, t_idx] = B["CAS"][i]
+
+        # Underflow warnings
+        for k in ["RBC", "FFP", "PLT", "CRYO", "WBB"]:
+            if B[k][i] < 0:
+                print(f"⚠️ NEGATIVE {k} at time {t:.1f} hrs (Node {i}): {B[k][i]:.2f}")
+
+        # Low supply alerts
+        for k in INIT_STOCK:
+            if k == "CAS":
+                continue
+            if B[k][i] < THRESHOLD_FRACTION * INIT_STOCK[k]:
+                low_supply_events[k][i].append(t)
+
+        if (t > t_setup[i] and NR_init[i] > 0 and B_init["WBB"][i] < 1.0 and live_WBB[i, t_idx] < 1.0):
+            wbb_overwhelmed_events[i].append(t)
+
+    # Final safeguard: Clamp all B[k] to ≥ 0
+    for k in B:
+        B[k] = np.maximum(B[k], 0)
+
+    return casualties
+
+
+# Initial state
+B_state = {k: B_init[k].copy() for k in B_init}
+NR_state = NR_init.copy()
+NU_state = NU_init.copy()
+
+live_WBB = np.zeros((N, len(time)))
+live_PLT = np.zeros((N, len(time)))
+live_CAS = np.zeros((N, len(time)))
+
+results = {k: np.zeros((N, len(time))) for k in ["RBC", "FFP", "PLT", "CRYO", "WBB", "CAS"]}
+
+for idx, t in enumerate(time):
+    step(t, B_state, NR_state, NU_state)
+    for k in ["RBC", "FFP", "PLT", "CRYO", "CAS"]:
+        results[k][:, idx] = B_state[k]
+    results["WBB"][:, idx] = [sum(qty for age, qty in wbb_queues[i]) for i in range(N)]
+
+
+
+# Plotting
+
+# Total unmet demand per node
+for i in range(N):
+    print(f"Node {i} total unmet patients: {int(np.sum(unmet_demand_log[i]))}")
+
+# Optional: plot unmet demand over time
+plt.figure(figsize=(10, 6))
+for i in range(N):
+    plt.plot(time, unmet_demand_log[i], label=f"Node {i}")
+plt.xlabel("Time (hours)")
+plt.ylabel("Unmet Patients")
+plt.title("Unmet Transfusion Demand Over Time")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+fig, axs = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
+
+for i in range(N):
+    axs[0].plot(time, results["RBC"][i], label=f'FOB {i}')
+axs[0].set_ylabel('RBC Units')
+axs[0].legend()
+
+for i in range(N):
+    axs[1].plot(time, results["FFP"][i], label=f'FOB {i}')
+axs[1].set_ylabel('FFP Units')
+
+for i in range(N):
+    axs[2].plot(time, results["PLT"][i], label=f'FOB {i}')
+axs[2].set_ylabel('PLT Units')
+
+for i in range(N):
+    axs[3].plot(time, results["CRYO"][i], label=f'FOB {i}')
+axs[3].set_ylabel('CRYO Units')
+
+for i in range(N):
+    axs[4].plot(time, results["WBB"][i], label=f'FOB {i}')
+axs[4].set_ylabel('WBB Units')
+
+for i in range(N):
+    axs[5].plot(time, results["CAS"][i], label=f'FOB {i}')
+axs[5].set_ylabel('CAS Units')
+
+axs[-1].set_xlabel('Time (hours)')
+plt.tight_layout()
+plt.show()
+
+
+def run_sim_with_interval(interval_hours):
+    global B_state, NR_state, NU_state, wbb_queues, plt_queues, redistribution_events, last_redistribution_check
+    global unmet_demand_log, live_WBB, live_PLT, live_CAS, resupply_schedule, blackout_windows
+
+    # Reset everything
+    B_state = {k: B_init[k].copy() for k in B_init}
+    NR_state = NR_init.copy()
+    NU_state = NU_init.copy()
+    wbb_queues = [[] for _ in range(N)]
+    plt_queues = [[] for _ in range(N)]
+    redistribution_events = []
+    last_redistribution_check = -12.0
+
+    live_WBB.fill(0)
+    live_PLT.fill(0)
+    live_CAS.fill(0)
+    unmet_demand_log.fill(0)
+
+    # Rebuild blackout windows
+    blackout_windows = []
+    t = 0
+    while t < T_max:
+        if np.random.rand() < 0.15:
+            start = t
+            duration = np.random.uniform(24, 48)
+            blackout_windows.append((start, start + duration))
+            t += duration
+        else:
+            t += 6
+
+    # Rebuild resupply schedule using fixed interval
+    resupply_schedule = [[] for _ in range(N)]
+    for i in range(N):
+        t = 0
+        while t < T_max:
+            delay = np.random.uniform(2, 4)
+            arrival = t + delay
+            if not in_blackout(arrival, blackout_windows):
+                resupply_schedule[i].append(arrival)
+            t += interval_hours
+
+    # Run the simulation loop
+    for idx, t in enumerate(time):
+        step(t, B_state, NR_state, NU_state)
+
+    # Analyze outcomes
+    total_unmet = np.sum(unmet_demand_log)
+    first_failure_time = None
+    if total_unmet > 0:
+        failure_indices = np.where(unmet_demand_log.sum(axis=0) > 0)[0]
+        if len(failure_indices) > 0:
+            first_failure_time = failure_indices[0] * dt
+
+    return {
+        "interval": interval_hours,
+        "total_unmet": total_unmet,
+        "first_failure_time": first_failure_time,
+        "final_RBC": np.mean(B_state["RBC"]),
+        "final_WBB": np.mean(B_state["WBB"]),
+        "casualties_total": np.sum(B_state["CAS"]),
+        "unmet_by_node": [int(np.sum(unmet_demand_log[i])) for i in range(N)],
+        "unmet_over_time": unmet_demand_log.copy(),  # for plotting
+    }
+
+def plot_full_blood_panel(sim_result, interval):
+    plt.figure(figsize=(14, 18))
+    fig, axs = plt.subplots(6, 1, figsize=(12, 18), sharex=True)
+
+    fob_labels = [f"FOB {i}" for i in range(N)]
+    results = sim_result
+
+    # RBC
+    for i in range(N):
+        axs[0].plot(time, results["RBC"][i], label=fob_labels[i])
+    axs[0].set_ylabel("RBC Units")
+    axs[0].legend()
+
+    # FFP
+    for i in range(N):
+        axs[1].plot(time, results["FFP"][i], label=fob_labels[i])
+    axs[1].set_ylabel("FFP Units")
+
+    # PLT
+    for i in range(N):
+        axs[2].plot(time, results["PLT"][i], label=fob_labels[i])
+    axs[2].set_ylabel("PLT Units")
+
+    # CRYO
+    for i in range(N):
+        axs[3].plot(time, results["CRYO"][i], label=fob_labels[i])
+    axs[3].set_ylabel("CRYO Units")
+
+    # WBB
+    for i in range(N):
+        axs[4].plot(time, results["WBB"][i], label=fob_labels[i])
+    axs[4].set_ylabel("WBB Units")
+
+    # CAS
+    for i in range(N):
+        axs[5].plot(time, results["CAS"][i], label=fob_labels[i])
+    axs[5].set_ylabel("CAS Units")
+
+    axs[-1].set_xlabel("Time (hours)")
+
+    plt.suptitle(f"📊 Blood Product Trends — Resupply Interval = {interval} hrs", fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.show()
+
+
+def run_stress_test(intervals=[24, 36, 48, 60, 72, 84, 96, 108, 120],):
+    results = []
+
+    for interval in intervals:
+        print(f"🔁 Running simulation for resupply interval: {interval} hrs")
+        outcome = run_sim_with_interval(interval)
+        results.append(outcome)
+
+    # Print summary
+    print("\n🧾 STRESS TEST SUMMARY:")
+    print(f"{'Interval (hrs)':>15} | {'Unmet Total':>12} | {'1st Failure (hr)':>16}")
+    print("-" * 50)
+    for res in results:
+        print(f"{res['interval']:>15} | {res['total_unmet']:>12} | {res['first_failure_time'] or 'None':>16}")
+
+    # Plot unmet demand over time for each interval
+    plt.figure(figsize=(12, 6))
+    for res in results:
+        unmet_total = res["unmet_over_time"].sum(axis=0)
+        plt.plot(time, unmet_total, label=f"{res['interval']} hrs")
+
+    plt.title("📉 Unmet Demand Over Time — Varying Resupply Intervals")
+    plt.xlabel("Time (hours)")
+    plt.ylabel("Unmet Transfusions (All Nodes)")
+    plt.legend(title="Interval")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    return results
+
+
+
+stress_results = run_stress_test()
+for interval in [24, 48, 108, 120]:
+    result = run_sim_with_interval(interval)
+    plot_full_blood_panel(result, interval)
