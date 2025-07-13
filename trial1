@@ -10,10 +10,10 @@ time = np.arange(0, T_max, dt)
 
 # Initial deployment quantities per node (CSH)
 INIT_RBC = 300
-INIT_FFP = 100
-INIT_PLT = 24
+INIT_FFP = 200
+INIT_PLT = 100
 INIT_CRYO = 100
-INIT_WBB = 0
+INIT_WBB = 60
 INIT_CAS = 0
 
 THRESHOLD_FRACTION = 0.10
@@ -156,7 +156,7 @@ B_init = {
     "FFP": np.full(N, INIT_FFP, dtype=float),
     "PLT": np.full(N, INIT_PLT, dtype=float),
     "CRYO": np.full(N, INIT_CRYO, dtype=float),
-    "WBB": np.zeros(N, dtype=float),
+    "WBB": np.full(N, INIT_WBB, dtype=float),
     "CAS": np.zeros(N, dtype=float),
 }
 NR_init = np.full(N, N_total, dtype=float)
@@ -208,6 +208,13 @@ EXPIRY_PLT = 120  # hours
 # Per-node age-tracking queues (list of [age, quantity] pairs)
 wbb_queues = [[] for _ in range(N)]
 plt_queues = [[] for _ in range(N)]
+# ✅ PATCH: Initialize queues with deployed WBB and PLT inventory
+for i in range(N):
+    if INIT_WBB > 0:
+        wbb_queues[i].append([0.0, INIT_WBB])
+    if INIT_PLT > 0:
+        plt_queues[i].append([0.0, INIT_PLT])
+
 
 
 def step(t, B, NR, NU):
@@ -248,7 +255,7 @@ def step(t, B, NR, NU):
             wbb_ok = B["WBB"][i] >= 1
             cryo_ok = B["CRYO"][i] >= 1
 
-            # Try full MTP
+            # 🥇 Full MTP (1:1:1)
             if rbc_ok and ffp_ok and plt_ok:
                 plt_queues[i], used = withdraw_from_queue(plt_queues[i], 1)
                 if used >= 1:
@@ -257,32 +264,46 @@ def step(t, B, NR, NU):
                     B["PLT"][i] -= used
                     continue
 
-            # Try 1 WBB
-            elif wbb_ok:
+            # 🥈 Whole Blood (WBB)
+            if wbb_ok:
                 wbb_queues[i], used = withdraw_from_queue(wbb_queues[i], 1)
                 if used >= 1:
                     B["WBB"][i] -= used
                     continue
 
-            # Try RBC + FFP only
-            elif rbc_ok and ffp_ok:
+            # 🥉 RBC + FFP (no PLT)
+            if rbc_ok and ffp_ok:
                 B["RBC"][i] -= 4
                 B["FFP"][i] -= 4
                 continue
 
-            # Try 1 FFP + 1 PLT
-            elif B["FFP"][i] >= 1 and plt_ok:
+            # 🔁 RBC + PLT (no FFP)
+            if rbc_ok and plt_ok:
                 plt_queues[i], used = withdraw_from_queue(plt_queues[i], 1)
                 if used >= 1:
-                    B["FFP"][i] -= 1
+                    B["RBC"][i] -= 4
                     B["PLT"][i] -= used
                     continue
 
-            # Final fallback: 1 CRYO
-            elif cryo_ok:
+            # 🔁 FFP + PLT (no RBC)
+            if ffp_ok and plt_ok:
+                plt_queues[i], used = withdraw_from_queue(plt_queues[i], 1)
+                if used >= 1:
+                    B["FFP"][i] -= 4
+                    B["PLT"][i] -= used
+                    continue
+
+            # 🧊 CRYO fallback
+            if cryo_ok:
                 B["CRYO"][i] -= 1
                 continue
 
+            # 🔚 RBC-only last-ditch fallback
+            if B["RBC"][i] >= 2:
+                B["RBC"][i] -= 2
+                continue
+
+            # Nothing available — unmet
             unmet = True
 
         if unmet:
@@ -422,6 +443,13 @@ def run_sim_with_interval(interval_hours):
     NU_state = NU_init.copy()
     wbb_queues = [[] for _ in range(N)]
     plt_queues = [[] for _ in range(N)]
+    # ✅ PATCH: Initialize queues with deployed WBB and PLT inventory
+    for i in range(N):
+        if INIT_WBB > 0:
+            wbb_queues[i].append([0.0, INIT_WBB])
+        if INIT_PLT > 0:
+            plt_queues[i].append([0.0, INIT_PLT])
+
     redistribution_events = []
     last_redistribution_check = -12.0
 
