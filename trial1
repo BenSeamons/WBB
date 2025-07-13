@@ -430,6 +430,9 @@ def run_sim_with_interval(interval_hours):
     live_CAS.fill(0)
     unmet_demand_log.fill(0)
 
+    # Initialize per-product time-series results for this run
+    results_ts = {k: np.zeros((N, len(time))) for k in ["RBC", "FFP", "PLT", "CRYO", "WBB", "CAS"]}
+
     # Rebuild blackout windows
     blackout_windows = []
     t = 0
@@ -456,6 +459,9 @@ def run_sim_with_interval(interval_hours):
     # Run the simulation loop
     for idx, t in enumerate(time):
         step(t, B_state, NR_state, NU_state)
+        for k in ["RBC", "FFP", "PLT", "CRYO", "CAS"]:
+            results_ts[k][:, idx] = B_state[k]
+        results_ts["WBB"][:, idx] = [sum(qty for age, qty in wbb_queues[i]) for i in range(N)]
 
     # Analyze outcomes
     total_unmet = np.sum(unmet_demand_log)
@@ -474,10 +480,15 @@ def run_sim_with_interval(interval_hours):
         "casualties_total": np.sum(B_state["CAS"]),
         "unmet_by_node": [int(np.sum(unmet_demand_log[i])) for i in range(N)],
         "unmet_over_time": unmet_demand_log.copy(),  # for plotting
+        "RBC": results_ts["RBC"],
+        "FFP": results_ts["FFP"],
+        "PLT": results_ts["PLT"],
+        "CRYO": results_ts["CRYO"],
+        "WBB": results_ts["WBB"],
+        "CAS": results_ts["CAS"],
     }
 
 def plot_full_blood_panel(sim_result, interval):
-    plt.figure(figsize=(14, 18))
     fig, axs = plt.subplots(6, 1, figsize=(12, 18), sharex=True)
 
     fob_labels = [f"FOB {i}" for i in range(N)]
